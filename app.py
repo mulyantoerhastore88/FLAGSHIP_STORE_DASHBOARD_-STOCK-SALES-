@@ -98,6 +98,13 @@ st.markdown("""
         border-left: 4px solid #3B82F6;
         margin-bottom: 1rem;
     }
+    .threshold-info {
+        background: #F0F9FF;
+        border-left: 4px solid #3B82F6;
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 1rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -118,14 +125,10 @@ def load_data():
         ws_store_kamus = sh_kamus.get_worksheet(0)
         df_store_kamus = pd.DataFrame(ws_store_kamus.get_all_records())
         
-        # Debug: Tampilkan kolom yang ada di Sheet 1
-        st.sidebar.info(f"📋 Kolom di Sheet 1: {', '.join(df_store_kamus.columns.tolist())}")
-        
         # Validasi kolom Store di Sheet 1
         if 'Store' in df_store_kamus.columns:
             st.sidebar.success("✅ Kolom 'Store' ditemukan di Sheet 1")
         else:
-            st.sidebar.error("❌ Kolom 'Store' tidak ditemukan di Sheet 1")
             # Coba cari kolom dengan nama yang mirip
             store_cols = [col for col in df_store_kamus.columns if 'store' in col.lower() or 'nama' in col.lower()]
             if store_cols:
@@ -139,16 +142,13 @@ def load_data():
         ws_sku_kamus = sh_kamus.get_worksheet(1)
         df_sku_kamus = pd.DataFrame(ws_sku_kamus.get_all_records())
         
-        # Debug: Tampilkan kolom yang ada di Sheet 2
-        st.sidebar.info(f"📋 Kolom di Sheet 2: {', '.join(df_sku_kamus.columns.tolist())}")
-        
         # Validasi kolom SKU dan SKU_Category
         if 'SKU' not in df_sku_kamus.columns:
             sku_cols = [col for col in df_sku_kamus.columns if 'sku' in col.lower()]
             if sku_cols:
                 df_sku_kamus = df_sku_kamus.rename(columns={sku_cols[0]: 'SKU'})
             else:
-                st.sidebar.error("❌ Kolom 'SKU' tidak ditemukan di Sheet 2")
+                st.error("❌ Kolom 'SKU' tidak ditemukan di Sheet 2")
                 return None, None, None, None
         
         if 'SKU_Category' not in df_sku_kamus.columns:
@@ -156,7 +156,7 @@ def load_data():
             if category_cols:
                 df_sku_kamus = df_sku_kamus.rename(columns={category_cols[0]: 'SKU_Category'})
             else:
-                st.sidebar.error("❌ Kolom 'SKU_Category' tidak ditemukan di Sheet 2")
+                st.error("❌ Kolom 'SKU_Category' tidak ditemukan di Sheet 2")
                 return None, None, None, None
                 
     except Exception as e:
@@ -234,7 +234,7 @@ def load_data():
                     if 'Location Code' not in df.columns:
                         df['Location Code'] = store_code
                     
-                    df['Store_Code'] = store_code  # Simpan kode store asli
+                    df['Store_Code'] = store_code
                     stock_dfs.append(df[['Location Code', 'SKU', 'Total', 'Store_Code']])
                     
             except Exception as e:
@@ -244,9 +244,9 @@ def load_data():
     
     return df_sales, df_store_kamus, df_sku_kamus, df_stock_total
 
-# --- FUNGSI UNTUK INVENTORY CONTROL TABLE ---
+# --- FUNGSI UNTUK INVENTORY CONTROL TABLE DENGAN 8 WEEKS THRESHOLD ---
 def create_inventory_control_table(analysis_df, sales_data, store_name, store_display_name=None):
-    """Membuat tabel Inventory Control seperti yang diinginkan"""
+    """Membuat tabel Inventory Control dengan threshold 8 minggu"""
     
     if store_display_name is None:
         store_display_name = store_name
@@ -257,30 +257,50 @@ def create_inventory_control_table(analysis_df, sales_data, store_name, store_di
     if store_data.empty:
         return None
     
-    # Hitung metrics berdasarkan status
-    status_counts = store_data['Status'].value_counts()
+    # Hitung Week Cover dengan benar (Month Cover * 4.33)
+    store_data['Week_Cover'] = store_data['Month_Cover'] * 4.33
     
-    # Mapping status ke kategori control
-    ideal_count = status_counts.get('✅ Healthy', 0) + status_counts.get('📈 Good Buffer', 0)
-    need_replenishment = status_counts.get('🚨 Critical', 0) + status_counts.get('⚠️ Need Reorder', 0)
-    over_stock = status_counts.get('🛑 Overstock', 0)
-    non_moving = status_counts.get('📦 New/Dead Stock', 0)
+    # Klasifikasi berdasarkan WEEK COVER (8 minggu = healthy threshold)
+    def classify_by_weekcover(row):
+        if row['Total'] > 0 and row['AMS'] == 0:
+            return "📦 New/Dead Stock"
+        elif row['Week_Cover'] < 2:      # < 2 minggu
+            return "🚨 Critical"
+        elif row['Week_Cover'] < 4:      # < 4 minggu
+            return "⚠️ Need Reorder"
+        elif row['Week_Cover'] <= 8:     # ≤ 8 minggu (HEALTHY THRESHOLD)
+            return "✅ Healthy"
+        elif row['Week_Cover'] <= 12:    # ≤ 12 minggu
+            return "📈 Good Buffer"
+        else:                            # > 12 minggu
+            return "🛑 Overstock"
+    
+    store_data['Week_Status'] = store_data.apply(classify_by_weekcover, axis=1)
+    
+    # Hitung metrics berdasarkan WEEK status
+    week_status_counts = store_data['Week_Status'].value_counts()
+    
+    # Mapping status ke kategori control berdasarkan WEEK COVER
+    ideal_count = week_status_counts.get('✅ Healthy', 0) + week_status_counts.get('📈 Good Buffer', 0)
+    need_replenishment = week_status_counts.get('🚨 Critical', 0) + week_status_counts.get('⚠️ Need Reorder', 0)
+    over_stock = week_status_counts.get('🛑 Overstock', 0)
+    non_moving = week_status_counts.get('📦 New/Dead Stock', 0)
     
     # Hitung total metrics
     count_of_sku = len(store_data)
     qty_stock = store_data['Total'].sum()
     avg_sales = store_data['AMS'].sum()
     
-    # Hitung Week Cover (Month Cover / 4.33)
-    store_data['Week_Cover'] = store_data['Month_Cover'] * (30/7) / 4.33  # Konversi bulan ke minggu
+    # Hitung Average Week Cover (median)
     avg_weekcover = store_data['Week_Cover'].median()
     
-    # Hitung Replenishment Quantity Suggested (untuk yang perlu reorder)
-    reorder_data = store_data[store_data['Status'].isin(['🚨 Critical', '⚠️ Need Reorder'])]
+    # Hitung Replenishment Quantity Suggested untuk mencapai 8 minggu cover
+    reorder_data = store_data[store_data['Week_Status'].isin(['🚨 Critical', '⚠️ Need Reorder'])]
     if not reorder_data.empty:
+        # Target 8 minggu cover (2 bulan inventory)
         reorder_data['Replenishment_Suggest'] = np.where(
-            reorder_data['Month_Cover'] < 1,
-            (reorder_data['AMS'] * 1.5 - reorder_data['Total']).clip(lower=0),
+            reorder_data['Week_Cover'] < 8,
+            (reorder_data['AMS'] * 2 - reorder_data['Total']).clip(lower=0),  # Target 2 bulan
             (reorder_data['AMS'] * 0.5).clip(lower=0)
         )
         replenishment_qty_suggest = reorder_data['Replenishment_Suggest'].sum()
@@ -335,7 +355,8 @@ def create_inventory_control_table(analysis_df, sales_data, store_name, store_di
             'avg_sales': int(avg_sales),
             'replenishment_qty_suggest': int(replenishment_qty_suggest),
             'weekcover': avg_weekcover
-        }
+        },
+        'week_status_data': store_data
     }
 
 # --- FUNGSI HELPER UNTUK ANALISIS DENGAN FILTER SKU ---
@@ -407,7 +428,7 @@ def calculate_stock_health(df_stock, df_sales_mapped, sku_kamus, store_name=None
         analysis_df = pd.merge(analysis_df, sku_sales, on='SKU', how='left')
     else:
         analysis_df['Qty_3Mo'] = 0
-        analysis_df['Avg_Price'] = analysis_df['Total'].median()  # Default price
+        analysis_df['Avg_Price'] = analysis_df['Total'].median()
         analysis_df['AMS'] = 0
     
     # Fill NaN values
@@ -419,26 +440,29 @@ def calculate_stock_health(df_stock, df_sales_mapped, sku_kamus, store_name=None
     analysis_df['Month_Cover'] = np.where(
         analysis_df['AMS'] > 0,
         analysis_df['Total'] / analysis_df['AMS'],
-        999  # Jika tidak ada sales
+        999
     )
+    
+    # Hitung Week Cover (Month Cover * 4.33)
+    analysis_df['Week_Cover'] = analysis_df['Month_Cover'] * 4.33
     
     # Hitung nilai stock
     analysis_df['Stock_Value'] = analysis_df['Total'] * analysis_df['Avg_Price']
     
-    # Klasifikasi Status (dengan mapping yang sesuai untuk inventory control)
+    # Klasifikasi Status berdasarkan WEEK COVER (8 minggu threshold)
     def classify_status(row):
         if row['Total'] > 0 and row['AMS'] == 0:
-            return "📦 New/Dead Stock"  # Non Moving Stock
-        elif row['Month_Cover'] < 0.5:
-            return "🚨 Critical"  # Need Replenishment
-        elif row['Month_Cover'] < 1:
-            return "⚠️ Need Reorder"  # Need Replenishment
-        elif row['Month_Cover'] <= 1.5:
-            return "✅ Healthy"  # Ideal Stock
-        elif row['Month_Cover'] <= 3:
-            return "📈 Good Buffer"  # Ideal Stock
+            return "📦 New/Dead Stock"
+        elif row['Week_Cover'] < 2:
+            return "🚨 Critical"
+        elif row['Week_Cover'] < 4:
+            return "⚠️ Need Reorder"
+        elif row['Week_Cover'] <= 8:  # HEALTHY THRESHOLD = 8 MINGGU
+            return "✅ Healthy"
+        elif row['Week_Cover'] <= 12:
+            return "📈 Good Buffer"
         else:
-            return "🛑 Overstock"  # Over Stock
+            return "🛑 Overstock"
     
     analysis_df['Status'] = analysis_df.apply(classify_status, axis=1)
     
@@ -466,7 +490,7 @@ try:
                 color: white;">
         <h1 style="color: white; margin: 0; font-size: 2.8rem;">🏭 Flagship Store Inventory Control</h1>
         <p style="opacity: 0.9; font-size: 1.1rem; margin-top: 0.5rem;">Dashboard Monitoring & Replenishment System</p>
-        <p style="opacity: 0.8; font-size: 0.9rem; margin-top: 0.2rem;">As of: """ + datetime.now().strftime("%d/%m/%Y") + """</p>
+        <p style="opacity: 0.8; font-size: 0.9rem; margin-top: 0.2rem;">As of: """ + datetime.now().strftime("%d/%m/%Y") + """ | Health Threshold: ≥8 Weeks Cover</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -474,22 +498,9 @@ try:
     with st.spinner("🔄 Loading real-time data from Google Sheets..."):
         df_sales, df_store_kamus, df_sku_kamus, df_stock = load_data()
     
-    if df_sales.empty or df_stock.empty or df_sku_kamus.empty:
-        st.error("❌ Data tidak dapat dimuat. Pastikan file SKU Kamus (Sheet 2) sudah terisi dengan benar.")
+    if df_sales is None or df_stock is None or df_sku_kamus is None:
+        st.error("❌ Data tidak dapat dimuat. Pastikan file sumber dan struktur data sudah benar.")
         st.stop()
-    
-    # Tampilkan summary SKU Kamus
-    with st.expander("📋 SKU Kamus Summary", expanded=False):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Total SKU in Kamus", len(df_sku_kamus))
-        with col2:
-            category_counts = df_sku_kamus['SKU_Category'].value_counts()
-            st.metric("Categories", len(category_counts))
-        with col3:
-            st.metric("Sample SKU", df_sku_kamus['SKU'].iloc[0] if len(df_sku_kamus) > 0 else "N/A")
-        
-        st.dataframe(df_sku_kamus, use_container_width=True, height=200)
     
     # --- DATA PREPARATION DENGAN FILTER SKU ---
     df_sales['Orderdate'] = pd.to_datetime(df_sales['Orderdate'], dayfirst=True, errors='coerce')
@@ -508,30 +519,35 @@ try:
         
         # Apply mapping ke stock data
         if 'Location Code' in df_stock.columns:
-            # Coba mapping dari Location Code ke Store Name
             df_stock['Store_Name'] = df_stock['Location Code'].map(pos_to_store_mapping)
             
-            # Jika tidak ada mapping, gunakan Store_Code (AMB, BSB, MCD) dengan mapping custom
+            # Jika tidak ada mapping, gunakan Store_Code dengan mapping custom
             store_code_mapping = {'AMB': 'AEON Mall BSD', 'BSB': 'Botani Square Bogor', 'MCD': 'Margo City Depok'}
             missing_mask = df_stock['Store_Name'].isna()
             df_stock.loc[missing_mask, 'Store_Name'] = df_stock.loc[missing_mask, 'Store_Code'].map(store_code_mapping)
             
-        st.success(f"✅ Store mapping berhasil: {len(pos_to_store_mapping)} stores ditemukan")
-        
-        # Tampilkan preview mapping
-        with st.expander("🔍 Preview Store Mapping", expanded=False):
-            st.write("POS Code → Store Name Mapping:")
-            for pos, store_name in list(pos_to_store_mapping.items())[:5]:
-                st.write(f"{pos} → {store_name}")
-                
     else:
-        st.warning("⚠️ Tidak dapat melakukan store mapping. Kolom 'Store' atau 'POS' tidak ditemukan di Sheet 1")
         # Fallback: gunakan kolom yang ada
         df_sales_mapped = pd.merge(df_sales, df_store_kamus, left_on='POS_Code', right_on='POS', how='left')
+        df_stock['Store_Name'] = df_stock['Store_Code']
     
     # --- SIDEBAR FILTER PROFESIONAL ---
     with st.sidebar:
         st.markdown("### ⚙️ Dashboard Configuration")
+        
+        # Info Threshold
+        st.markdown("**📊 Health Threshold Configuration**")
+        st.markdown("""
+        <div class="threshold-info">
+        <strong>Stock Classification:</strong><br>
+        • 🚨 Critical: < 2 weeks<br>
+        • ⚠️ Need Reorder: 2-4 weeks<br>
+        • ✅ Healthy: 4-8 weeks<br>
+        • 📈 Good Buffer: 8-12 weeks<br>
+        • 🛑 Overstock: > 12 weeks<br>
+        <strong>Target: ≥ 8 weeks cover</strong>
+        </div>
+        """, unsafe_allow_html=True)
         
         # Date Display
         st.markdown(f"**📅 Date: {datetime.now().strftime('%d/%m/%Y')}**")
@@ -558,12 +574,15 @@ try:
         if not selected_stores:
             selected_stores = available_stores
         
-        # Display Mode
-        st.markdown("**📱 Display Mode**")
-        display_mode = st.radio(
-            "Table Display:",
-            ["Detailed View", "Summary View"],
-            index=0
+        # Weekcover Target Adjustment
+        st.markdown("**🎯 Weekcover Target**")
+        target_weekcover = st.slider(
+            "Target Weekcover (weeks):",
+            min_value=4,
+            max_value=16,
+            value=8,
+            step=1,
+            help="Target minimum weekcover for healthy inventory"
         )
     
     # Filter SKU Kamus berdasarkan kategori yang dipilih
@@ -584,7 +603,7 @@ try:
         total_skus = analysis_df['SKU'].nunique()
         total_units = analysis_df['Total'].sum()
         
-        # Hitung distribusi status
+        # Hitung distribusi status berdasarkan week cover
         status_counts = analysis_df['Status'].value_counts()
         ideal_count = status_counts.get('✅ Healthy', 0) + status_counts.get('📈 Good Buffer', 0)
         need_replenishment = status_counts.get('🚨 Critical', 0) + status_counts.get('⚠️ Need Reorder', 0)
@@ -611,7 +630,7 @@ try:
             <div class="metric-card">
                 <div class="metric-title">Ideal Stock Ratio</div>
                 <div class="metric-value">{health_percentage:.1f}%</div>
-                <div class="metric-change">{ideal_count} of {total_items} SKUs</div>
+                <div class="metric-change">≥ {target_weekcover} weeks cover</div>
             </div>
             """, unsafe_allow_html=True)
         
@@ -625,9 +644,8 @@ try:
             """, unsafe_allow_html=True)
         
         with col4:
-            avg_cover = analysis_df[analysis_df['Month_Cover'] < 50]['Month_Cover'].median()
-            avg_cover = 0 if pd.isna(avg_cover) else avg_cover
-            avg_weekcover = avg_cover * (30/7) / 4.33
+            avg_weekcover = analysis_df['Week_Cover'].median()
+            avg_weekcover = 0 if pd.isna(avg_weekcover) else avg_weekcover
             st.markdown(f"""
             <div class="metric-card">
                 <div class="metric-title">Avg. Week Cover</div>
@@ -643,6 +661,16 @@ try:
         st.markdown(f"### 🏪 Flagship Store Inventory Control - {datetime.now().strftime('%d/%m/%Y')}")
         
         if not analysis_df.empty:
+            # Info Threshold
+            st.markdown(f"""
+            <div class="threshold-info">
+            <strong>Health Threshold Applied:</strong><br>
+            • ✅ Healthy: 4-8 weeks cover<br>
+            • 📈 Good Buffer: 8-12 weeks cover<br>
+            • Target: ≥8 weeks inventory coverage
+            </div>
+            """, unsafe_allow_html=True)
+            
             # Buat inventory control table untuk setiap store
             inventory_tables = []
             
@@ -674,7 +702,7 @@ try:
                     
                     # Tampilkan Control section dalam 3 kolom
                     control_cols = st.columns(3)
-                    items_per_col = 3  # 9 items total, 3 per column
+                    items_per_col = 3
                     
                     for i in range(3):
                         with control_cols[i]:
@@ -737,17 +765,17 @@ try:
                         "Store": st.column_config.TextColumn("Store Name"),
                         "Ideal Stock": st.column_config.NumberColumn(
                             "Ideal",
-                            help="SKUs with healthy stock level",
+                            help="SKUs with healthy stock level (≥4 weeks cover)",
                             format="%d"
                         ),
                         "Need Replenishment": st.column_config.NumberColumn(
                             "Need Repl.",
-                            help="SKUs that need replenishment",
+                            help="SKUs that need replenishment (<4 weeks cover)",
                             format="%d"
                         ),
                         "Over Stock": st.column_config.NumberColumn(
                             "Over Stock",
-                            help="SKUs with overstock condition",
+                            help="SKUs with overstock condition (>12 weeks cover)",
                             format="%d"
                         ),
                         "Non Moving": st.column_config.NumberColumn(
@@ -757,7 +785,8 @@ try:
                         ),
                         "Weekcover": st.column_config.NumberColumn(
                             "Weekcover",
-                            format="%.1f weeks"
+                            format="%.1f weeks",
+                            help="Median weeks of inventory cover"
                         )
                     },
                     use_container_width=True,
@@ -770,8 +799,9 @@ try:
                 with col1:
                     # Bar chart untuk SKU distribution
                     fig1 = px.bar(summary_df, x='Store', y=['Ideal Stock', 'Need Replenishment', 'Over Stock', 'Non Moving'],
-                                title='SKU Distribution by Store',
-                                barmode='group')
+                                title='SKU Distribution by Store (Week Cover Based)',
+                                barmode='group',
+                                labels={'value': 'Number of SKUs', 'variable': 'Status'})
                     fig1.update_layout(height=400)
                     st.plotly_chart(fig1, use_container_width=True)
                 
@@ -784,20 +814,20 @@ try:
                     
                     fig2 = px.pie(
                         values=[total_ideal, total_replenish, total_over, total_non_moving],
-                        names=['Ideal Stock', 'Need Replenishment', 'Over Stock', 'Non Moving'],
+                        names=['Ideal Stock (≥4 weeks)', 'Need Replenishment (<4 weeks)', 'Over Stock (>12 weeks)', 'Non Moving'],
                         title='Total SKU Distribution Across All Stores',
-                        color=['Ideal Stock', 'Need Replenishment', 'Over Stock', 'Non Moving'],
+                        color=['Ideal Stock (≥4 weeks)', 'Need Replenishment (<4 weeks)', 'Over Stock (>12 weeks)', 'Non Moving'],
                         color_discrete_map={
-                            'Ideal Stock': '#10B981',
-                            'Need Replenishment': '#F59E0B',
-                            'Over Stock': '#EF4444',
+                            'Ideal Stock (≥4 weeks)': '#10B981',
+                            'Need Replenishment (<4 weeks)': '#F59E0B',
+                            'Over Stock (>12 weeks)': '#EF4444',
                             'Non Moving': '#6B7280'
                         }
                     )
                     fig2.update_layout(height=400)
                     st.plotly_chart(fig2, use_container_width=True)
             
-            # Download Button untuk Inventory Control - DIPINDAHKAN KE SINI
+            # Download Button untuk Inventory Control
             if len(inventory_tables) > 0:
                 st.markdown("---")
                 st.markdown("### 📥 Export Reports")
@@ -843,7 +873,7 @@ try:
                         f"detailed_analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                         "text/csv",
                         use_container_width=True,
-                        help="Download detailed SKU-level analysis"
+                        help="Download detailed SKU-level analysis with week cover"
                     )
                 
                 with col_dl3:
@@ -867,8 +897,8 @@ try:
                 col_t1, col_t2, col_t3 = st.columns(3)
                 
                 with col_t1:
-                    st.metric("Available Stores", len(selected_stores))
-                    st.write("Stores:", ", ".join(selected_stores))
+                    st.metric("Available Stores", len(available_stores))
+                    st.write("Stores:", ", ".join(available_stores[:3]) + ("..." if len(available_stores) > 3 else ""))
                 
                 with col_t2:
                     st.metric("SKU Categories", len(selected_categories))
@@ -887,17 +917,18 @@ try:
                 'SKU': 'nunique',
                 'Total': 'sum',
                 'Stock_Value': 'sum',
-                'Month_Cover': 'median',
+                'Week_Cover': 'median',
                 'Status': lambda x: (x.isin(['✅ Healthy', '📈 Good Buffer'])).sum() / len(x) * 100
             }).round(2).reset_index()
             
-            store_summary.columns = ['Store', 'SKU Count', 'Total Units', 'Stock Value', 'Avg Month Cover', 'Health %']
+            store_summary.columns = ['Store', 'SKU Count', 'Total Units', 'Stock Value', 'Avg Week Cover', 'Health %']
             
             # Display store cards
             cols = st.columns(len(store_summary))
             for idx, (col, (_, row)) in enumerate(zip(cols, store_summary.iterrows())):
                 with col:
                     health_color = "#10B981" if row['Health %'] > 70 else "#F59E0B" if row['Health %'] > 40 else "#EF4444"
+                    week_cover_status = "✅" if row['Avg Week Cover'] >= 8 else "⚠️" if row['Avg Week Cover'] >= 4 else "❌"
                     st.markdown(f"""
                     <div class="store-card">
                         <h4 style="margin: 0 0 10px 0;">{row['Store']}</h4>
@@ -914,8 +945,8 @@ try:
                             <span style="font-weight: 600; color: {health_color};">{row['Health %']:.1f}%</span>
                         </div>
                         <div style="margin-top: 10px; background: #f3f4f6; border-radius: 5px; padding: 5px;">
-                            <div style="font-size: 0.8rem; opacity: 0.7;">Week Cover:</div>
-                            <div style="font-weight: 700; font-size: 1.2rem;">{(row['Avg Month Cover'] * (30/7) / 4.33):.1f}</div>
+                            <div style="font-size: 0.8rem; opacity: 0.7;">Week Cover: {week_cover_status}</div>
+                            <div style="font-weight: 700; font-size: 1.2rem;">{row['Avg Week Cover']:.1f}</div>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
@@ -927,9 +958,10 @@ try:
             
             with col1:
                 fig1 = px.bar(store_summary, x='Store', y='Health %',
-                            title='Stock Health Score by Store',
+                            title='Stock Health Score by Store (≥8 weeks target)',
                             color='Health %',
-                            color_continuous_scale='RdYlGn')
+                            color_continuous_scale='RdYlGn',
+                            labels={'Health %': 'Health Score %'})
                 fig1.update_layout(height=400)
                 st.plotly_chart(fig1, use_container_width=True)
             
@@ -937,15 +969,16 @@ try:
                 # Stacked bar chart untuk status distribution per store
                 status_by_store = analysis_df.groupby(['Store_Name', 'Status']).size().unstack(fill_value=0)
                 fig2 = px.bar(status_by_store, 
-                            title='Status Distribution by Store',
-                            barmode='stack')
+                            title='Status Distribution by Store (Week Cover Based)',
+                            barmode='stack',
+                            labels={'value': 'Number of SKUs', 'variable': 'Status'})
                 fig2.update_layout(height=400)
                 st.plotly_chart(fig2, use_container_width=True)
     
     with tab3:
-        st.markdown("### 🚨 Priority Action Items")
+        st.markdown("### 🚨 Priority Action Items (Based on Week Cover)")
         
-        # Filter SKUs yang butuh perhatian
+        # Filter SKUs yang butuh perhatian (Critical dan Need Reorder)
         priority_items = analysis_df[analysis_df['Status'].isin(['🚨 Critical', '⚠️ Need Reorder'])]
         
         if not priority_items.empty:
@@ -954,21 +987,20 @@ try:
                 store_items = priority_items[priority_items['Store_Name'] == store]
                 
                 with st.expander(f"**{store}** - {len(store_items)} SKUs Need Attention", expanded=True):
-                    # Calculate recommended order quantity
+                    # Calculate recommended order quantity untuk mencapai 8 minggu cover
                     store_items = store_items.copy()
-                    store_items['Recommended_Order'] = np.where(
-                        store_items['Month_Cover'] < 1,
-                        (store_items['AMS'] * 1.5 - store_items['Total']).clip(lower=1),
-                        (store_items['AMS'] * 0.5).clip(lower=1)
-                    )
+                    store_items['Week_Cover_Gap'] = 8 - store_items['Week_Cover']  # Gap untuk mencapai 8 minggu
+                    store_items['Week_Cover_Gap'] = store_items['Week_Cover_Gap'].clip(lower=0.5)  # Minimal order 0.5 minggu
+                    
+                    # Hitung rekomendasi order
+                    store_items['Recommended_Order'] = (store_items['AMS'] * (store_items['Week_Cover_Gap'] / 4.33)).clip(lower=1)
                     
                     # Display table
-                    display_cols = ['SKU', 'SKU_Category', 'Total', 'AMS', 'Month_Cover', 'Recommended_Order', 'Status']
-                    styled_df = store_items[display_cols].sort_values('Month_Cover')
+                    display_cols = ['SKU', 'SKU_Category', 'Total', 'AMS', 'Week_Cover', 'Recommended_Order', 'Status']
+                    styled_df = store_items[display_cols].sort_values('Week_Cover')
                     
                     # Format untuk display
-                    styled_df['Month_Cover'] = styled_df['Month_Cover'].apply(lambda x: f"{x:.1f}x")
-                    styled_df['Week_Cover'] = (styled_df['Month_Cover'].str.replace('x', '').astype(float) * (30/7) / 4.33).apply(lambda x: f"{x:.1f}")
+                    styled_df['Week_Cover'] = styled_df['Week_Cover'].apply(lambda x: f"{x:.1f}")
                     styled_df['Recommended_Order'] = styled_df['Recommended_Order'].apply(lambda x: f"{int(x)} pcs")
                     styled_df['AMS'] = styled_df['AMS'].apply(lambda x: f"{x:.1f}/month")
                     
@@ -977,11 +1009,12 @@ try:
                         column_config={
                             "Status": st.column_config.TextColumn(
                                 width="small",
-                                help="Stock status classification"
+                                help="Stock status based on week cover"
                             ),
                             "Week_Cover": st.column_config.NumberColumn(
                                 "Week Cover",
-                                format="%.1f w"
+                                format="%.1f w",
+                                help="Current weeks of inventory cover"
                             )
                         },
                         use_container_width=True,
@@ -990,9 +1023,17 @@ try:
                     
                     # Total reorder summary
                     total_reorder = store_items['Recommended_Order'].astype(str).str.replace(' pcs', '').astype(float).sum()
-                    st.info(f"**Total Recommended Order for {store}: {int(total_reorder):,} units across {len(store_items)} SKUs**")
+                    current_weekcover = store_items['Week_Cover'].median()
+                    target_weekcover = 8
+                    st.info(f"""
+                    **Total Recommended Order for {store}:**
+                    - **{int(total_reorder):,} units** across {len(store_items)} SKUs
+                    - **Current avg weekcover:** {current_weekcover:.1f} weeks
+                    - **Target weekcover:** {target_weekcover} weeks
+                    - **To reach target:** +{(target_weekcover - current_weekcover):.1f} weeks needed
+                    """)
         else:
-            st.success("🎉 No critical items found! All stock levels are within acceptable ranges.")
+            st.success("🎉 No critical items found! All stock levels have ≥4 weeks cover.")
     
     with tab4:
         st.markdown("### 📈 Trends & Category Analysis")
@@ -1035,33 +1076,41 @@ try:
             
             st.plotly_chart(fig, use_container_width=True)
             
-            # Category performance analysis
-            st.markdown("#### Category Performance Analysis")
+            # Weekcover Distribution Analysis
+            st.markdown("#### 📊 Weekcover Distribution Analysis")
             
-            if 'SKU_Category' in analysis_df.columns:
-                # Heatmap: Store vs Category Performance
-                pivot_data = analysis_df.pivot_table(
-                    index='Store_Name',
-                    columns='SKU_Category',
-                    values='Stock_Value',
-                    aggfunc='sum',
-                    fill_value=0
-                )
-                
-                if not pivot_data.empty:
-                    fig_heat = px.imshow(pivot_data,
-                                       labels=dict(x="Category", y="Store", color="Stock Value"),
-                                       title="Stock Value Distribution (Store × Category)",
-                                       color_continuous_scale='Blues')
-                    fig_heat.update_layout(height=400)
-                    st.plotly_chart(fig_heat, use_container_width=True)
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Histogram weekcover
+                fig_wc1 = px.histogram(analysis_df, x='Week_Cover', nbins=20,
+                                     title='Distribution of Week Cover',
+                                     labels={'Week_Cover': 'Weeks of Inventory Cover'},
+                                     color_discrete_sequence=['#3B82F6'])
+                fig_wc1.add_vline(x=8, line_dash="dash", line_color="green", 
+                                annotation_text="Target: 8 weeks", annotation_position="top")
+                fig_wc1.add_vline(x=4, line_dash="dash", line_color="orange", 
+                                annotation_text="Min Healthy: 4 weeks", annotation_position="top")
+                fig_wc1.update_layout(height=400)
+                st.plotly_chart(fig_wc1, use_container_width=True)
+            
+            with col2:
+                # Weekcover by Category
+                if 'SKU_Category' in analysis_df.columns:
+                    fig_wc2 = px.box(analysis_df, x='SKU_Category', y='Week_Cover',
+                                   title='Week Cover by SKU Category',
+                                   labels={'Week_Cover': 'Weeks of Cover', 'SKU_Category': 'Category'})
+                    fig_wc2.add_hline(y=8, line_dash="dash", line_color="green", 
+                                    annotation_text="Target: 8 weeks")
+                    fig_wc2.update_layout(height=400)
+                    st.plotly_chart(fig_wc2, use_container_width=True)
     
     # --- FOOTER DAN DOWNLOAD ---
     st.markdown("---")
-    col1, col2, col3 = st.columns([2, 1, 1])
+    col1, col2 = st.columns([3, 1])
     
     with col1:
-        st.caption(f"Dashboard updated: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} | Data source: Google Sheets")
+        st.caption(f"Dashboard updated: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} | Data source: Google Sheets | Health Threshold: ≥8 weeks cover")
     
     with col2:
         if not analysis_df.empty:
@@ -1070,36 +1119,6 @@ try:
                 "📥 Download Full Report",
                 csv,
                 f"flagship_inventory_report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                "text/csv",
-                use_container_width=True
-            )
-    
-    with col3:
-        if len(inventory_tables) > 0:
-            # Buat summary report untuk inventory control
-            summary_report = []
-            for table in inventory_tables:
-                summary_report.append({
-                    'Date': datetime.now().strftime('%d/%m/%Y'),
-                    'Store': table['store_name'],
-                    'Ideal_Stock': table['raw_metrics']['ideal_stock'],
-                    'Need_Replenishment': table['raw_metrics']['need_replenishment'],
-                    'Over_Stock': table['raw_metrics']['over_stock'],
-                    'Non_Moving_Stock': table['raw_metrics']['non_moving'],
-                    'Count_of_SKU': table['raw_metrics']['count_of_sku'],
-                    'Qty_Stock': table['raw_metrics']['qty_stock'],
-                    'AVG_Sales': table['raw_metrics']['avg_sales'],
-                    'Replenishment_Qty_Suggest': table['raw_metrics']['replenishment_qty_suggest'],
-                    'Weekcover': table['raw_metrics']['weekcover']
-                })
-            
-            summary_df = pd.DataFrame(summary_report)
-            csv_summary = summary_df.to_csv(index=False).encode('utf-8')
-            
-            st.download_button(
-                "📋 Inventory Control",
-                csv_summary,
-                f"inventory_control_summary_{datetime.now().strftime('%Y%m%d')}.csv",
                 "text/csv",
                 use_container_width=True
             )
