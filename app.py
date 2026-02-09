@@ -619,7 +619,7 @@ try:
                     </div>
                     """, unsafe_allow_html=True)
                     
-                    # Tampilkan Control section
+                    # Tampilkan Control section dalam 3 kolom
                     control_cols = st.columns(3)
                     items_per_col = 3  # 9 items total, 3 per column
                     
@@ -644,7 +644,7 @@ try:
                     </div>
                     """, unsafe_allow_html=True)
                     
-                    # Tampilkan Grand Total metrics
+                    # Tampilkan Grand Total metrics dalam 5 kolom
                     total_cols = st.columns(5)
                     for idx, (col, (_, row)) in enumerate(zip(total_cols, table_data['grand_total_df'].iterrows())):
                         with col:
@@ -743,6 +743,87 @@ try:
                     )
                     fig2.update_layout(height=400)
                     st.plotly_chart(fig2, use_container_width=True)
+            
+            # Download Button untuk Inventory Control - DIPINDAHKAN KE SINI
+            if len(inventory_tables) > 0:
+                st.markdown("---")
+                st.markdown("### 📥 Export Reports")
+                
+                col_dl1, col_dl2, col_dl3 = st.columns(3)
+                
+                with col_dl1:
+                    # Download Inventory Control Summary
+                    summary_report = []
+                    for table in inventory_tables:
+                        summary_report.append({
+                            'Date': datetime.now().strftime('%d/%m/%Y'),
+                            'Store': table['store_name'],
+                            'Ideal_Stock': table['raw_metrics']['ideal_stock'],
+                            'Need_Replenishment': table['raw_metrics']['need_replenishment'],
+                            'Over_Stock': table['raw_metrics']['over_stock'],
+                            'Non_Moving_Stock': table['raw_metrics']['non_moving'],
+                            'Count_of_SKU': table['raw_metrics']['count_of_sku'],
+                            'Qty_Stock': table['raw_metrics']['qty_stock'],
+                            'AVG_Sales': table['raw_metrics']['avg_sales'],
+                            'Replenishment_Qty_Suggest': table['raw_metrics']['replenishment_qty_suggest'],
+                            'Weekcover': table['raw_metrics']['weekcover']
+                        })
+                    
+                    summary_df = pd.DataFrame(summary_report)
+                    csv_summary = summary_df.to_csv(index=False).encode('utf-8')
+                    
+                    st.download_button(
+                        "📋 Inventory Control",
+                        csv_summary,
+                        f"inventory_control_{datetime.now().strftime('%Y%m%d')}.csv",
+                        "text/csv",
+                        use_container_width=True,
+                        help="Download Inventory Control Summary"
+                    )
+                
+                with col_dl2:
+                    # Download Detailed Analysis
+                    csv = analysis_df.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        "📊 Detailed Analysis",
+                        csv,
+                        f"detailed_analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        "text/csv",
+                        use_container_width=True,
+                        help="Download detailed SKU-level analysis"
+                    )
+                
+                with col_dl3:
+                    # Download SKU Kamus yang digunakan
+                    if not df_sku_kamus_filtered.empty:
+                        csv_kamus = df_sku_kamus_filtered.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            "📝 SKU Filter",
+                            csv_kamus,
+                            f"sku_kamus_filter_{datetime.now().strftime('%Y%m%d')}.csv",
+                            "text/csv",
+                            use_container_width=True,
+                            help="Download filtered SKU Kamus"
+                        )
+        
+        else:
+            st.warning("⚠️ No data available for the selected filters. Please adjust your filter settings.")
+            
+            # Show available stores and categories for troubleshooting
+            with st.expander("🔍 Available Data Preview"):
+                col_t1, col_t2, col_t3 = st.columns(3)
+                
+                with col_t1:
+                    st.metric("Available Stores", len(selected_stores))
+                    st.write("Stores:", ", ".join(selected_stores))
+                
+                with col_t2:
+                    st.metric("SKU Categories", len(selected_categories))
+                    st.write("Categories:", ", ".join(selected_categories))
+                
+                with col_t3:
+                    st.metric("Total SKUs in Kamus", len(df_sku_kamus))
+                    st.write("Sample SKUs:", ", ".join(df_sku_kamus['SKU'].head(3).astype(str).tolist()))
     
     with tab2:
         st.markdown("### 🏪 Store Performance Overview")
