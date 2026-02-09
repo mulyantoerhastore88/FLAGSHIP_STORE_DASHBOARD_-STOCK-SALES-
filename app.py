@@ -100,7 +100,11 @@ try:
         df_sales_final = pd.merge(df_sales, df_kamus, left_on='POS_Code', right_on='POS', how='left')
         
         # Convert Date
-        df_sales_final['Orderdate'] = pd.to_datetime(df_sales_final['Orderdate'])
+        # Tambahkan parameter dayfirst=True agar membaca format DD/MM/YYYY
+        df_sales_final['Orderdate'] = pd.to_datetime(df_sales_final['Orderdate'], dayfirst=True, errors='coerce')
+        
+        # (Opsional) Hapus data yang tanggalnya error/kosong agar grafik tidak error
+        df_sales_final = df_sales_final.dropna(subset=['Orderdate'])
         
         # --- DASHBOARD UI ---
         st.title("🏭 Dashboard Flagship Store")
