@@ -57,6 +57,13 @@ st.markdown("""
         font-weight: 600;
         display: inline-block;
     }
+    .category-badge {
+        padding: 0.2rem 0.6rem;
+        border-radius: 12px;
+        font-size: 0.75rem;
+        font-weight: 500;
+        display: inline-block;
+    }
     .stProgress > div > div > div > div {
         background-color: #3B82F6;
     }
@@ -87,14 +94,30 @@ def load_data():
     )
     gc = gspread.authorize(credentials)
     
-    # Load Kamus Store
+    # Load Kamus Store (Sheet 1) dan SKU Kamus (Sheet 2)
     try:
         sh_kamus = gc.open("Offline Store Kamus")
-        ws_kamus = sh_kamus.get_worksheet(0)
-        df_kamus = pd.DataFrame(ws_kamus.get_all_records())
-    except:
-        st.error("⚠️ File 'Offline Store Kamus' tidak ditemukan!")
-        df_kamus = pd.DataFrame()
+        
+        # Sheet 1: Store Kamus
+        ws_store_kamus = sh_kamus.get_worksheet(0)
+        df_store_kamus = pd.DataFrame(ws_store_kamus.get_all_records())
+        
+        # Sheet 2: SKU Kamus (SKU dan Kategori)
+        ws_sku_kamus = sh_kamus.get_worksheet(1)
+        df_sku_kamus = pd.DataFrame(ws_sku_kamus.get_all_records())
+        
+        # Validasi kolom
+        if 'SKU' not in df_sku_kamus.columns:
+            st.error("❌ Kolom 'SKU' tidak ditemukan di Sheet 2")
+            df_sku_kamus = pd.DataFrame()
+        if 'SKU_Category' not in df_sku_kamus.columns:
+            st.error("❌ Kolom 'SKU_Category' tidak ditemukan di Sheet 2")
+            df_sku_kamus = pd.DataFrame()
+            
+    except Exception as e:
+        st.error(f"⚠️ Error loading kamus data: {e}")
+        df_store_kamus = pd.DataFrame()
+        df_sku_kamus = pd.DataFrame()
     
     # List semua spreadsheet
     all_files = gc.list_spreadsheet_files()
@@ -160,18 +183,48 @@ def load_data():
     
     df_stock_total = pd.concat(stock_dfs, ignore_index=True) if stock_dfs else pd.DataFrame()
     
-    return df_sales, df_kamus, df_stock_total
+    return df_sales, df_store_kamus, df_sku_kamus, df_stock_total
 
-# --- FUNGSI HELPER UNTUK ANALISIS ---
-def calculate_stock_health(df_stock, df_sales_mapped, store_name=None):
-    """Hitung health metrics untuk stock"""
+# --- FUNGSI HELPER UNTUK ANALISIS DENGAN FILTER SKU ---
+def filter_by_sku_kamus(df, sku_kamus):
+    """Filter dataframe hanya untuk SKU yang ada di SKU Kamus"""
+    if sku_kamus.empty:
+        return df
+    
+    valid_skus = sku_kamus['SKU'].astype(str).str.strip().unique()
+    
+    if 'ItemSKU' in df.columns:
+        # Untuk sales data
+        df_filtered = df[df['ItemSKU'].astype(str).str.strip().isin(valid_skus)].copy()
+        # Tambahkan kategori SKU
+        sku_mapping = sku_kamus.set_index('SKU')['SKU_Category'].to_dict()
+        df_filtered['SKU_Category'] = df_filtered['ItemSKU'].astype(str).str.strip().map(sku_mapping)
+    
+    elif 'SKU' in df.columns:
+        # Untuk stock data
+        df_filtered = df[df['SKU'].astype(str).str.strip().isin(valid_skus)].copy()
+        # Tambahkan kategori SKU
+        sku_mapping = sku_kamus.set_index('SKU')['SKU_Category'].to_dict()
+        df_filtered['SKU_Category'] = df_filtered['SKU'].astype(str).str.strip().map(sku_mapping)
+    
+    else:
+        return df
+    
+    return df_filtered
+
+def calculate_stock_health(df_stock, df_sales_mapped, sku_kamus, store_name=None):
+    """Hitung health metrics untuk stock (hanya SKU yang ada di kamus)"""
+    
+    # Filter hanya SKU yang ada di kamus
+    df_stock_filtered = filter_by_sku_kamus(df_stock, sku_kamus)
+    df_sales_filtered = filter_by_sku_kamus(df_sales_mapped, sku_kamus)
     
     if store_name:
-        stock_data = df_stock[df_stock['Store_Name'] == store_name].copy()
-        sales_data = df_sales_mapped[df_sales_mapped['Store_Name'] == store_name].copy()
+        stock_data = df_stock_filtered[df_stock_filtered['Store_Name'] == store_name].copy()
+        sales_data = df_sales_filtered[df_sales_filtered['Store_Name'] == store_name].copy()
     else:
-        stock_data = df_stock.copy()
-        sales_data = df_sales_mapped.copy()
+        stock_data = df_stock_filtered.copy()
+        sales_data = df_sales_filtered.copy()
     
     if stock_data.empty:
         return pd.DataFrame()
@@ -183,16 +236,26 @@ def calculate_stock_health(df_stock, df_sales_mapped, store_name=None):
     sales_data['Orderdate'] = pd.to_datetime(sales_data['Orderdate'], errors='coerce')
     recent_sales = sales_data[sales_data['Orderdate'] >= start_date_3mo]
     
-    sku_sales = recent_sales.groupby('ItemSKU').agg({
-        'ItemOrdered': 'sum',
-        'ItemPrice': 'mean'
-    }).reset_index()
-    sku_sales.columns = ['SKU', 'Qty_3Mo', 'Avg_Price']
-    sku_sales['AMS'] = sku_sales['Qty_3Mo'] / 3
+    if not recent_sales.empty:
+        sku_sales = recent_sales.groupby('ItemSKU').agg({
+            'ItemOrdered': 'sum',
+            'ItemPrice': 'mean'
+        }).reset_index()
+        sku_sales.columns = ['SKU', 'Qty_3Mo', 'Avg_Price']
+        sku_sales['AMS'] = sku_sales['Qty_3Mo'] / 3
+    else:
+        # Buat dataframe kosong jika tidak ada sales
+        sku_sales = pd.DataFrame(columns=['SKU', 'Qty_3Mo', 'Avg_Price', 'AMS'])
     
     # Gabungkan dengan stock
-    analysis_df = stock_data.groupby(['SKU', 'Store_Name']).agg({'Total': 'sum'}).reset_index()
-    analysis_df = pd.merge(analysis_df, sku_sales, on='SKU', how='left')
+    analysis_df = stock_data.groupby(['SKU', 'Store_Name', 'SKU_Category']).agg({'Total': 'sum'}).reset_index()
+    
+    if not sku_sales.empty:
+        analysis_df = pd.merge(analysis_df, sku_sales, on='SKU', how='left')
+    else:
+        analysis_df['Qty_3Mo'] = 0
+        analysis_df['Avg_Price'] = analysis_df['Total'].median()  # Default price
+        analysis_df['AMS'] = 0
     
     # Fill NaN values
     analysis_df['Qty_3Mo'] = analysis_df['Qty_3Mo'].fillna(0)
@@ -250,41 +313,51 @@ try:
                 color: white;">
         <h1 style="color: white; margin: 0; font-size: 2.8rem;">🏭 Supply Chain Command Center</h1>
         <p style="opacity: 0.9; font-size: 1.1rem; margin-top: 0.5rem;">Flagship Store Inventory & Replenishment Dashboard</p>
-        <p style="opacity: 0.8; font-size: 0.9rem; margin-top: 0.2rem;">Last Updated: """ + datetime.now().strftime("%d %b %Y, %H:%M") + """</p>
+        <p style="opacity: 0.8; font-size: 0.9rem; margin-top: 0.2rem;">SKU Filter Active: Only SKUs from SKU Kamus are displayed</p>
     </div>
     """, unsafe_allow_html=True)
     
     # Load data dengan spinner yang elegan
     with st.spinner("🔄 Loading real-time data from Google Sheets..."):
-        df_sales, df_kamus, df_stock = load_data()
+        df_sales, df_store_kamus, df_sku_kamus, df_stock = load_data()
     
-    if df_sales.empty or df_stock.empty:
-        st.error("❌ Data tidak dapat dimuat. Silakan periksa koneksi dan file sumber.")
+    if df_sales.empty or df_stock.empty or df_sku_kamus.empty:
+        st.error("❌ Data tidak dapat dimuat. Pastikan file SKU Kamus (Sheet 2) sudah terisi dengan benar.")
         st.stop()
     
-    # --- DATA PREPARATION ---
+    # Tampilkan summary SKU Kamus
+    with st.expander("📋 SKU Kamus Summary", expanded=False):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total SKU in Kamus", len(df_sku_kamus))
+        with col2:
+            category_counts = df_sku_kamus['SKU_Category'].value_counts()
+            st.metric("Categories", len(category_counts))
+        with col3:
+            st.metric("Sample SKU", df_sku_kamus['SKU'].iloc[0] if len(df_sku_kamus) > 0 else "N/A")
+        
+        st.dataframe(df_sku_kamus, use_container_width=True, height=200)
+    
+    # --- DATA PREPARATION DENGAN FILTER SKU ---
     df_sales['Orderdate'] = pd.to_datetime(df_sales['Orderdate'], dayfirst=True, errors='coerce')
     df_sales = df_sales.dropna(subset=['Orderdate'])
     
     # Mapping store code
     df_sales['POS_Code'] = df_sales['Ordernumber'].astype(str).str[:4]
-    df_sales_mapped = pd.merge(df_sales, df_kamus, left_on='POS_Code', right_on='POS', how='left')
+    df_sales_mapped = pd.merge(df_sales, df_store_kamus, left_on='POS_Code', right_on='POS', how='left')
     
     # --- SIDEBAR FILTER PROFESIONAL ---
     with st.sidebar:
         st.markdown("### ⚙️ Dashboard Configuration")
         
-        # Date Range Filter
-        st.markdown("**📅 Date Range**")
-        col1, col2 = st.columns(2)
-        with col1:
-            start_date = st.date_input("From", 
-                                     value=datetime.now() - timedelta(days=90),
-                                     key="start_date")
-        with col2:
-            end_date = st.date_input("To", 
-                                   value=datetime.now(),
-                                   key="end_date")
+        # SKU Category Filter (dari SKU Kamus)
+        st.markdown("**📊 SKU Category Filter**")
+        sku_categories = sorted(df_sku_kamus['SKU_Category'].dropna().unique().tolist())
+        selected_categories = st.multiselect(
+            "Select SKU Categories:",
+            options=sku_categories,
+            default=sku_categories
+        )
         
         # Store Selection
         st.markdown("**🏪 Store Selection**")
@@ -299,7 +372,7 @@ try:
             selected_stores = store_options[1:]
         
         # Status Filter
-        st.markdown("**📊 Stock Status Filter**")
+        st.markdown("**📈 Stock Status Filter**")
         status_options = ["🚨 Critical", "⚠️ Need Reorder", "✅ Healthy", "📈 Good Buffer", "🛑 Overstock", "📦 New/Dead Stock"]
         selected_status = st.multiselect(
             "Show statuses:",
@@ -312,6 +385,9 @@ try:
         reorder_threshold = st.slider("Reorder Threshold (months)", 0.5, 2.0, 1.0, 0.1)
         overstock_threshold = st.slider("Overstock Threshold (months)", 2.0, 6.0, 3.0, 0.5)
     
+    # Filter SKU Kamus berdasarkan kategori yang dipilih
+    df_sku_kamus_filtered = df_sku_kamus[df_sku_kamus['SKU_Category'].isin(selected_categories)] if selected_categories else df_sku_kamus
+    
     # Filter data berdasarkan pilihan store
     stock_filtered = df_stock[df_stock['Store_Name'].isin(selected_stores)] if selected_stores else df_stock
     sales_filtered = df_sales_mapped[df_sales_mapped['Store_Name'].isin(selected_stores)] if selected_stores else df_sales_mapped
@@ -319,12 +395,13 @@ try:
     # --- KPI CARDS ---
     st.markdown("### 📈 Executive Summary")
     
-    # Hitung metrics utama
-    analysis_df = calculate_stock_health(stock_filtered, sales_filtered)
+    # Hitung metrics utama dengan filter SKU
+    analysis_df = calculate_stock_health(stock_filtered, sales_filtered, df_sku_kamus_filtered)
     
     if not analysis_df.empty:
         total_stock_value = analysis_df['Stock_Value'].sum()
         total_skus = analysis_df['SKU'].nunique()
+        total_units = analysis_df['Total'].sum()
         
         # Hitung distribusi status
         status_counts = analysis_df['Status'].value_counts()
@@ -343,7 +420,7 @@ try:
             <div class="metric-card">
                 <div class="metric-title">Total Stock Value</div>
                 <div class="metric-value">Rp {total_stock_value:,.0f}</div>
-                <div class="metric-change">{total_skus} SKUs Active</div>
+                <div class="metric-change">{total_skus} SKUs | {len(selected_categories)} Categories</div>
             </div>
             """, unsafe_allow_html=True)
         
@@ -367,16 +444,47 @@ try:
         
         with col4:
             avg_cover = analysis_df[analysis_df['Month_Cover'] < 50]['Month_Cover'].median()
+            avg_cover = 0 if pd.isna(avg_cover) else avg_cover
             st.markdown(f"""
             <div class="metric-card">
                 <div class="metric-title">Avg. Month Cover</div>
                 <div class="metric-value">{avg_cover:.1f}x</div>
-                <div class="metric-change">Inventory Buffer</div>
+                <div class="metric-change">{total_units:,} Total Units</div>
             </div>
             """, unsafe_allow_html=True)
+        
+        # Category Distribution
+        st.markdown("#### 📊 Category Distribution")
+        category_cols = st.columns(min(4, len(selected_categories)))
+        
+        for idx, category in enumerate(selected_categories):
+            if idx < 4:  # Tampilkan maksimal 4 kategori di baris pertama
+                cat_data = analysis_df[analysis_df['SKU_Category'] == category]
+                with category_cols[idx]:
+                    cat_skus = len(cat_data)
+                    cat_units = cat_data['Total'].sum()
+                    cat_value = cat_data['Stock_Value'].sum()
+                    
+                    st.markdown(f"""
+                    <div style="background: #f8f9fa; padding: 1rem; border-radius: 10px; border-left: 4px solid #3B82F6;">
+                        <div style="font-weight: 600; font-size: 0.9rem; margin-bottom: 0.5rem;">{category}</div>
+                        <div style="display: flex; justify-content: space-between;">
+                            <span style="font-size: 0.8rem; opacity: 0.7;">SKUs:</span>
+                            <span style="font-weight: 700;">{cat_skus}</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between;">
+                            <span style="font-size: 0.8rem; opacity: 0.7;">Units:</span>
+                            <span style="font-weight: 700;">{cat_units:,}</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin-top: 0.5rem;">
+                            <span style="font-size: 0.8rem; opacity: 0.7;">Value:</span>
+                            <span style="font-weight: 700;">Rp {cat_value:,.0f}</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
     
     # --- TABBED INTERFACE ---
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Store Overview", "🚨 Priority Actions", "📦 Stock Analysis", "📈 Trends & Forecast"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Store Overview", "🚨 Priority Actions", "📦 Stock Analysis", "📈 Trends by Category"])
     
     with tab1:
         st.markdown("### 🏪 Store Performance Summary")
@@ -421,23 +529,24 @@ try:
                     """, unsafe_allow_html=True)
             
             # Store comparison chart
-            st.markdown("#### Store Comparison")
-            col1, col2 = st.columns(2)
+            st.markdown("#### Store Comparison by Category")
             
-            with col1:
-                fig1 = px.bar(store_summary, x='Store', y='Health %',
-                            title='Stock Health by Store',
-                            color='Health %',
-                            color_continuous_scale='RdYlGn')
-                fig1.update_layout(height=300)
-                st.plotly_chart(fig1, use_container_width=True)
+            # Heatmap: Store vs Category Performance
+            pivot_data = analysis_df.pivot_table(
+                index='Store_Name',
+                columns='SKU_Category',
+                values='Stock_Value',
+                aggfunc='sum',
+                fill_value=0
+            )
             
-            with col2:
-                fig2 = px.pie(analysis_df, names='Status', 
-                            title='Overall Stock Status Distribution',
-                            hole=0.4)
-                fig2.update_layout(height=300)
-                st.plotly_chart(fig2, use_container_width=True)
+            if not pivot_data.empty:
+                fig_heat = px.imshow(pivot_data,
+                                   labels=dict(x="Category", y="Store", color="Stock Value"),
+                                   title="Stock Value Distribution (Store × Category)",
+                                   color_continuous_scale='Blues')
+                fig_heat.update_layout(height=400)
+                st.plotly_chart(fig_heat, use_container_width=True)
     
     with tab2:
         st.markdown("### 🚨 Priority Action Items")
@@ -446,188 +555,162 @@ try:
         priority_items = analysis_df[analysis_df['Status'].isin(['🚨 Critical', '⚠️ Need Reorder'])]
         
         if not priority_items.empty:
-            # Group by store untuk reorder recommendations
-            for store in priority_items['Store_Name'].unique():
-                store_items = priority_items[priority_items['Store_Name'] == store]
+            # Group by category untuk analisis
+            st.markdown("#### Action Items by Category")
+            
+            for category in priority_items['SKU_Category'].unique():
+                cat_items = priority_items[priority_items['SKU_Category'] == category]
                 
-                with st.expander(f"**{store}** - {len(store_items)} SKUs Need Attention", expanded=True):
+                with st.expander(f"**{category}** - {len(cat_items)} SKUs Need Attention", expanded=True):
                     # Calculate recommended order quantity
-                    store_items = store_items.copy()
-                    store_items['Recommended_Order'] = np.where(
-                        store_items['Month_Cover'] < 1,
-                        (store_items['AMS'] * 1.5 - store_items['Total']).clip(lower=1),
-                        (store_items['AMS'] * 0.5).clip(lower=1)
+                    cat_items = cat_items.copy()
+                    cat_items['Recommended_Order'] = np.where(
+                        cat_items['Month_Cover'] < 1,
+                        (cat_items['AMS'] * 1.5 - cat_items['Total']).clip(lower=1),
+                        (cat_items['AMS'] * 0.5).clip(lower=1)
                     )
                     
-                    # Display table
-                    display_cols = ['SKU', 'Total', 'AMS', 'Month_Cover', 'Recommended_Order', 'Status']
-                    styled_df = store_items[display_cols].sort_values('Month_Cover')
-                    
-                    # Format untuk display
-                    styled_df['Month_Cover'] = styled_df['Month_Cover'].apply(lambda x: f"{x:.1f}x")
-                    styled_df['Recommended_Order'] = styled_df['Recommended_Order'].apply(lambda x: f"{int(x)} pcs")
-                    styled_df['AMS'] = styled_df['AMS'].apply(lambda x: f"{x:.1f}/month")
-                    
-                    st.dataframe(
-                        styled_df,
-                        column_config={
-                            "Status": st.column_config.TextColumn(
-                                width="small",
-                                help="Stock status classification"
-                            ),
-                            "Month_Cover": st.column_config.NumberColumn(
-                                "Cover",
-                                help="Current stock divided by monthly sales"
-                            )
-                        },
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                    
-                    # Total reorder summary
-                    total_reorder = store_items['Recommended_Order'].sum()
-                    st.info(f"**Total Recommended Order for {store}: {int(total_reorder):,} units across {len(store_items)} SKUs**")
+                    # Display table grouped by store
+                    for store in cat_items['Store_Name'].unique():
+                        store_items = cat_items[cat_items['Store_Name'] == store]
+                        
+                        st.markdown(f"**Store: {store}**")
+                        display_cols = ['SKU', 'Total', 'AMS', 'Month_Cover', 'Recommended_Order', 'Status']
+                        styled_df = store_items[display_cols].sort_values('Month_Cover')
+                        
+                        # Format untuk display
+                        styled_df['Month_Cover'] = styled_df['Month_Cover'].apply(lambda x: f"{x:.1f}x")
+                        styled_df['Recommended_Order'] = styled_df['Recommended_Order'].apply(lambda x: f"{int(x)} pcs")
+                        styled_df['AMS'] = styled_df['AMS'].apply(lambda x: f"{x:.1f}/month")
+                        
+                        st.dataframe(
+                            styled_df,
+                            column_config={
+                                "Status": st.column_config.TextColumn(
+                                    width="small",
+                                    help="Stock status classification"
+                                )
+                            },
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                        
+                        # Total reorder summary per store-category
+                        total_reorder = store_items['Recommended_Order'].sum()
+                        st.info(f"**Total recommended order for {store} ({category}): {int(total_reorder):,} units**")
         else:
             st.success("🎉 No critical items found! All stock levels are within acceptable ranges.")
     
     with tab3:
-        st.markdown("### 📦 Detailed Stock Analysis")
+        st.markdown("### 📦 Detailed Stock Analysis by Category")
         
-        # Advanced filtering
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            min_cover = st.number_input("Min Month Cover", 0.0, 50.0, 0.0, 0.5)
-        with col2:
-            max_cover = st.number_input("Max Month Cover", 0.0, 50.0, 10.0, 0.5)
-        with col3:
-            min_stock = st.number_input("Min Stock Qty", 0, 1000, 0, 10)
+        # Pilih kategori untuk detail view
+        selected_detail_category = st.selectbox(
+            "Select Category for Detailed View:",
+            options=selected_categories
+        )
         
-        # Filter analysis dataframe
-        filtered_analysis = analysis_df[
-            (analysis_df['Month_Cover'] >= min_cover) &
-            (analysis_df['Month_Cover'] <= max_cover) &
-            (analysis_df['Total'] >= min_stock) &
-            (analysis_df['Status'].isin(selected_status))
-        ]
-        
-        # Tampilkan dalam tabs untuk masing-masing store
-        store_tabs = st.tabs([f"📊 {store}" for store in filtered_analysis['Store_Name'].unique()])
-        
-        for tab, store in zip(store_tabs, filtered_analysis['Store_Name'].unique()):
-            with tab:
-                store_data = filtered_analysis[filtered_analysis['Store_Name'] == store]
-                
-                # Metrics untuk store ini
-                col1, col2, col3 = st.columns(3)
+        if selected_detail_category:
+            category_data = analysis_df[analysis_df['SKU_Category'] == selected_detail_category]
+            
+            if not category_data.empty:
+                # Metrics untuk kategori ini
+                col1, col2, col3, col4 = st.columns(4)
                 with col1:
-                    st.metric("Total SKUs", len(store_data))
+                    st.metric("SKUs in Category", len(category_data))
                 with col2:
-                    st.metric("Total Units", f"{store_data['Total'].sum():,}")
+                    st.metric("Total Units", f"{category_data['Total'].sum():,}")
                 with col3:
-                    healthy_pct = (store_data['Status'].isin(['✅ Healthy', '📈 Good Buffer'])).sum() / len(store_data) * 100
-                    st.metric("Health Score", f"{healthy_pct:.1f}%")
+                    st.metric("Stock Value", f"Rp {category_data['Stock_Value'].sum():,.0f}")
+                with col4:
+                    avg_cover = category_data['Month_Cover'].median()
+                    st.metric("Median Cover", f"{avg_cover:.1f}x")
                 
-                # Interactive data table
-                st.dataframe(
-                    store_data[['SKU', 'Status', 'Total', 'AMS', 'Month_Cover', 'Stock_Value']].sort_values('Month_Cover'),
-                    column_config={
-                        "Status": st.column_config.SelectboxColumn(
-                            "Status",
-                            help="Current stock status",
-                            width="small",
-                            options=status_options
-                        ),
-                        "Month_Cover": st.column_config.ProgressColumn(
-                            "Month Cover",
-                            help="Current stock divided by monthly sales",
-                            format="%.1fx",
-                            min_value=0,
-                            max_value=10
-                        ),
-                        "Stock_Value": st.column_config.NumberColumn(
-                            "Value (Rp)",
-                            format="Rp %.0f"
+                # Interactive data table dengan grouping per store
+                for store in category_data['Store_Name'].unique():
+                    store_cat_data = category_data[category_data['Store_Name'] == store]
+                    
+                    with st.expander(f"**{store}** - {len(store_cat_data)} SKUs", expanded=True):
+                        st.dataframe(
+                            store_cat_data[['SKU', 'Status', 'Total', 'AMS', 'Month_Cover', 'Stock_Value']].sort_values('Month_Cover'),
+                            column_config={
+                                "Status": st.column_config.SelectboxColumn(
+                                    "Status",
+                                    help="Current stock status",
+                                    width="small",
+                                    options=status_options
+                                ),
+                                "Month_Cover": st.column_config.ProgressColumn(
+                                    "Month Cover",
+                                    help="Current stock divided by monthly sales",
+                                    format="%.1fx",
+                                    min_value=0,
+                                    max_value=10
+                                ),
+                                "Stock_Value": st.column_config.NumberColumn(
+                                    "Value (Rp)",
+                                    format="Rp %.0f"
+                                )
+                            },
+                            use_container_width=True,
+                            height=300
                         )
-                    },
-                    use_container_width=True,
-                    height=400
-                )
     
     with tab4:
-        st.markdown("### 📈 Sales Trends & Forecast")
+        st.markdown("### 📈 Category Performance Trends")
         
-        # Sales trend analysis
-        if not sales_filtered.empty:
-            # Monthly sales trend
-            sales_filtered['Month'] = sales_filtered['Orderdate'].dt.to_period('M')
-            monthly_sales = sales_filtered.groupby('Month').agg({
-                'ItemOrdered': 'sum',
-                'ItemPrice': lambda x: (x * sales_filtered.loc[x.index, 'ItemOrdered']).sum() / sales_filtered.loc[x.index, 'ItemOrdered'].sum()
-            }).reset_index()
+        # Sales trend analysis per kategori
+        if not sales_filtered.empty and 'SKU_Category' in sales_filtered.columns:
+            # Filter sales hanya untuk SKU yang ada di kamus
+            sales_cat_filtered = filter_by_sku_kamus(sales_filtered, df_sku_kamus_filtered)
             
-            monthly_sales['Month'] = monthly_sales['Month'].dt.to_timestamp()
-            monthly_sales['Revenue'] = monthly_sales['ItemOrdered'] * monthly_sales['ItemPrice']
-            
-            # Plot trend
-            fig = make_subplots(specs=[[{"secondary_y": True}]])
-            
-            fig.add_trace(
-                go.Scatter(x=monthly_sales['Month'], y=monthly_sales['ItemOrdered'],
-                          name="Units Sold", line=dict(color='#3B82F6', width=3)),
-                secondary_y=False,
-            )
-            
-            fig.add_trace(
-                go.Bar(x=monthly_sales['Month'], y=monthly_sales['Revenue'],
-                      name="Revenue", marker_color='#10B981', opacity=0.6),
-                secondary_y=True,
-            )
-            
-            fig.update_layout(
-                title="Monthly Sales Trend",
-                hovermode="x unified",
-                height=400
-            )
-            
-            fig.update_yaxes(title_text="Units Sold", secondary_y=False)
-            fig.update_yaxes(title_text="Revenue (Rp)", secondary_y=True)
-            
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Forecast kebutuhan stock
-            st.markdown("#### 📊 Stock Cover Analysis by Store")
-            
-            # Hitung stock cover per store
-            cover_by_store = analysis_df.groupby('Store_Name').agg({
-                'Month_Cover': ['mean', 'median', 'min', 'max']
-            }).round(2)
-            
-            cover_by_store.columns = ['Avg Cover', 'Median Cover', 'Min Cover', 'Max Cover']
-            st.dataframe(cover_by_store, use_container_width=True)
-            
-            # Heatmap of stock status by store
-            pivot_data = analysis_df.pivot_table(
-                index='Store_Name',
-                columns='Status',
-                values='SKU',
-                aggfunc='count',
-                fill_value=0
-            )
-            
-            if not pivot_data.empty:
-                fig_heat = px.imshow(pivot_data,
-                                   labels=dict(x="Status", y="Store", color="SKU Count"),
-                                   title="Stock Status Distribution by Store",
+            if not sales_cat_filtered.empty:
+                # Monthly sales trend per category
+                sales_cat_filtered['Month'] = sales_cat_filtered['Orderdate'].dt.to_period('M')
+                monthly_sales_cat = sales_cat_filtered.groupby(['Month', 'SKU_Category']).agg({
+                    'ItemOrdered': 'sum',
+                    'ItemPrice': lambda x: (x * sales_cat_filtered.loc[x.index, 'ItemOrdered']).sum() / sales_cat_filtered.loc[x.index, 'ItemOrdered'].sum()
+                }).reset_index()
+                
+                monthly_sales_cat['Month'] = monthly_sales_cat['Month'].dt.to_timestamp()
+                monthly_sales_cat['Revenue'] = monthly_sales_cat['ItemOrdered'] * monthly_sales_cat['ItemPrice']
+                
+                # Plot trend per category
+                fig = px.line(monthly_sales_cat, x='Month', y='ItemOrdered',
+                            color='SKU_Category',
+                            title='Monthly Sales Trend by Category',
+                            markers=True)
+                fig.update_layout(height=400, hovermode="x unified")
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Category comparison bar chart
+                st.markdown("#### 📊 Current Stock Analysis by Category")
+                
+                # Bar chart: Stock Cover by Category
+                fig2 = px.box(analysis_df, x='SKU_Category', y='Month_Cover',
+                            title='Stock Cover Distribution by Category',
+                            color='SKU_Category')
+                fig2.update_layout(height=400, showlegend=False)
+                fig2.update_yaxes(title_text="Month Cover")
+                st.plotly_chart(fig2, use_container_width=True)
+                
+                # Heatmap: Status Distribution by Category
+                status_by_category = analysis_df.groupby(['SKU_Category', 'Status']).size().unstack(fill_value=0)
+                
+                if not status_by_category.empty:
+                    fig3 = px.imshow(status_by_category.T,
+                                   labels=dict(x="Category", y="Status", color="Count"),
+                                   title="Status Distribution by Category",
                                    color_continuous_scale='RdYlGn')
-                fig_heat.update_layout(height=400)
-                st.plotly_chart(fig_heat, use_container_width=True)
+                    fig3.update_layout(height=400)
+                    st.plotly_chart(fig3, use_container_width=True)
     
     # --- FOOTER DAN DOWNLOAD ---
     st.markdown("---")
-    col1, col2 = st.columns([3, 1])
+    col1, col2, col3 = st.columns([2, 1, 1])
     
     with col1:
-        st.caption(f"Dashboard updated: {datetime.now().strftime('%d %b %Y %H:%M:%S')} | Data source: Google Sheets")
+        st.caption(f"Dashboard updated: {datetime.now().strftime('%d %b %Y %H:%M:%S')} | Showing {len(analysis_df)} SKUs from {len(selected_categories)} categories")
     
     with col2:
         if not analysis_df.empty:
@@ -636,6 +719,17 @@ try:
                 "📥 Download Full Report",
                 csv,
                 f"supply_chain_report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                "text/csv",
+                use_container_width=True
+            )
+    
+    with col3:
+        if not df_sku_kamus_filtered.empty:
+            csv_kamus = df_sku_kamus_filtered.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "📋 SKU Kamus",
+                csv_kamus,
+                f"sku_kamus_filtered_{datetime.now().strftime('%Y%m%d')}.csv",
                 "text/csv",
                 use_container_width=True
             )
