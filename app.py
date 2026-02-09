@@ -87,72 +87,187 @@ def load_data():
     return df_sales, df_kamus, df_stock_total
 
 # --- PROSES DATA ---
+# ... (Kode bagian atas load_data TETAP SAMA, tidak perlu diubah) ...
+
+# --- PROSES DATA & LOGIC SUPPLY CHAIN ---
 try:
     df_sales, df_kamus, df_stock = load_data()
     
-    if df_sales is not None:
-        # 1. MAPPING STORE NAME KE SALES
-        # Ambil 4 karakter kiri dari Ordernumber
-        df_sales['POS_Code'] = df_sales['Ordernumber'].astype(str).str[:4]
+    if df_sales is not None and df_stock is not None:
+        # 1. DATA PREPARATION
+        # Fix Date Format
+        df_sales['Orderdate'] = pd.to_datetime(df_sales['Orderdate'], dayfirst=True, errors='coerce')
+        df_sales = df_sales.dropna(subset=['Orderdate'])
         
-        # Merge dengan Kamus (POS -> Store_Name)
-        # Pastikan kolom di df_kamus namanya 'POS' dan 'Store_Name' sesuai gambar
+        # Mapping Store ke Sales
+        df_sales['POS_Code'] = df_sales['Ordernumber'].astype(str).str[:4]
         df_sales_final = pd.merge(df_sales, df_kamus, left_on='POS_Code', right_on='POS', how='left')
         
-        # Convert Date
-        # Tambahkan parameter dayfirst=True agar membaca format DD/MM/YYYY
-        df_sales_final['Orderdate'] = pd.to_datetime(df_sales_final['Orderdate'], dayfirst=True, errors='coerce')
-        
-        # (Opsional) Hapus data yang tanggalnya error/kosong agar grafik tidak error
-        df_sales_final = df_sales_final.dropna(subset=['Orderdate'])
-        
         # --- DASHBOARD UI ---
-        st.title("🏭 Dashboard Flagship Store")
+        st.title("🏭 Supply Chain Command Center")
         
-        # Filter Sidebar
-        st.sidebar.header("Filter")
-        selected_store = st.sidebar.multiselect(
-            "Pilih Store", 
-            options=df_sales_final['Store_Name'].unique(),
-            default=df_sales_final['Store_Name'].unique()
+        # SIDEBAR FILTER
+        st.sidebar.header("Configuration")
+        
+        # Pilih Store
+        all_stores = sorted(df_sales_final['Store_Name'].dropna().unique().tolist())
+        selected_store = st.sidebar.selectbox("Select Store Scope:", ["All Stores"] + all_stores)
+        
+        # Filter Data Berdasarkan Store
+        if selected_store != "All Stores":
+            sales_filtered = df_sales_final[df_sales_final['Store_Name'] == selected_store]
+            stock_filtered = df_stock[df_stock['Location Code'] == selected_store]
+        else:
+            sales_filtered = df_sales_final
+            stock_filtered = df_stock
+
+        # --- CORE CALCULATION (THE BRAIN) ---
+        
+        # 1. Tentukan Periode 3 Bulan Terakhir (Rolling)
+        max_date = sales_filtered['Orderdate'].max()
+        start_date_3mo = max_date - pd.DateOffset(days=90)
+        
+        # 2. Hitung Sales 3 Bulan Terakhir per SKU
+        sales_3mo = sales_filtered[sales_filtered['Orderdate'] >= start_date_3mo]
+        sku_sales_agg = sales_3mo.groupby('ItemSKU')['ItemOrdered'].sum().reset_index()
+        sku_sales_agg.rename(columns={'ItemOrdered': 'Qty_3Mo'}, inplace=True)
+        
+        # Hitung Average Monthly Sales (AMS)
+        sku_sales_agg['AMS'] = sku_sales_agg['Qty_3Mo'] / 3
+        
+        # 3. Agregasi Stock Saat Ini per SKU
+        sku_stock_agg = stock_filtered.groupby('SKU')['Total'].sum().reset_index()
+        
+        # 4. GABUNGKAN DATA STOCK & SALES (MASTER TABLE)
+        # Left join ke stock, karena kita mau analisa inventory yg kita punya
+        df_analysis = pd.merge(sku_stock_agg, sku_sales_agg, left_on='SKU', right_on='ItemSKU', how='left')
+        
+        # Fill NaN (Barang ada stock tapi gak ada sales 3 bulan terakhir)
+        df_analysis['AMS'] = df_analysis['AMS'].fillna(0)
+        df_analysis['Qty_3Mo'] = df_analysis['Qty_3Mo'].fillna(0)
+        
+        # 5. HITUNG MONTH COVER
+        # Hindari pembagian dengan nol
+        import numpy as np
+        df_analysis['Month_Cover'] = np.where(
+            df_analysis['AMS'] > 0, 
+            df_analysis['Total'] / df_analysis['AMS'], 
+            999 # Jika sales 0, set angka tinggi (Infinite Cover/Dead Stock)
         )
         
-        # Filter Data
-        filtered_sales = df_sales_final[df_sales_final['Store_Name'].isin(selected_store)]
-        filtered_stock = df_stock[df_stock['Location Code'].isin(selected_store)]
-        
-        # KPI Utama
-        col1, col2, col3 = st.columns(3)
-        total_omset = (filtered_sales['ItemPrice'] * filtered_sales['ItemOrdered']).sum()
-        total_qty_sold = filtered_sales['ItemOrdered'].sum()
-        total_stock = filtered_stock['Total'].sum()
-        
-        col1.metric("Total Revenue", f"Rp {total_omset:,.0f}")
-        col2.metric("Items Sold", f"{total_qty_sold} Pcs")
-        col3.metric("Current Stock", f"{total_stock} Pcs")
-        
-        st.divider()
-        
-        # TABS VISUALISASI
-        tab1, tab2 = st.tabs(["📊 Sales Analysis", "📦 Stock Monitor"])
-        
-        with tab1:
-            st.subheader("Tren Penjualan Harian")
-            daily_sales = filtered_sales.groupby('Orderdate')['ItemOrdered'].sum().reset_index()
-            st.line_chart(daily_sales, x='Orderdate', y='ItemOrdered')
+        # 6. KLASIFIKASI STATUS (Logic Bapak)
+        def classify_stock(row):
+            cover = row['Month_Cover']
+            sales = row['AMS']
             
-            st.subheader("Raw Data Sales")
-            st.dataframe(filtered_sales)
+            if sales == 0 and row['Total'] > 0:
+                return "Dead Stock / New"
+            elif cover < 1.0:
+                return "🚨 Reorder Now" # Need Replenishment
+            elif 1.0 <= cover <= 1.5:
+                return "✅ Healthy"
+            else: # > 1.5
+                return "⚠️ Overstock"
+
+        df_analysis['Status'] = df_analysis.apply(classify_stock, axis=1)
+        
+        # --- VISUALISASI PROFESSIONAL ---
+        
+        # A. TOP LEVEL METRICS
+        col1, col2, col3, col4 = st.columns(4)
+        
+        total_stock_pcs = df_analysis['Total'].sum()
+        total_value_est = (sales_filtered['ItemPrice'].mean() * total_stock_pcs) # Estimasi kasar value
+        
+        # Hitung % Healthy
+        count_status = df_analysis['Status'].value_counts()
+        pct_healthy = (count_status.get('✅ Healthy', 0) / len(df_analysis)) * 100
+        
+        col1.metric("Total Stock Qty", f"{total_stock_pcs:,.0f}")
+        col2.metric("Active SKUs", f"{len(df_analysis)}")
+        col3.metric("Healthy Stock Ratio", f"{pct_healthy:.1f}%")
+        col4.metric("Last Sales Date", max_date.strftime('%d %b %Y'))
+        
+        st.markdown("---")
+        
+        # B. STOCK COMPOSITION & ACTION PLAN
+        c1, c2 = st.columns([1, 2])
+        
+        with c1:
+            st.subheader("Stock Health Composition")
+            st.bar_chart(df_analysis['Status'].value_counts())
             
-        with tab2:
-            st.subheader("Posisi Stock per SKU")
-            # Group by SKU agar rapi
-            stock_by_sku = filtered_stock.groupby('SKU')['Total'].sum().sort_values(ascending=False).head(20)
-            st.bar_chart(stock_by_sku)
+            st.info("""
+            **Logic Klasifikasi:**
+            - **Reorder:** Cover < 1 Bulan
+            - **Healthy:** Cover 1 - 1.5 Bulan
+            - **Overstock:** Cover > 1.5 Bulan
+            """)
             
-            st.subheader("Raw Data Stock")
-            st.dataframe(filtered_stock)
+        with c2:
+            st.subheader("⚠️ Priority Action: Reorder Needed")
+            # Filter hanya yang butuh reorder
+            reorder_df = df_analysis[df_analysis['Status'] == "🚨 Reorder Now"].sort_values('Month_Cover')
+            
+            # Tampilkan tabel simple
+            st.dataframe(
+                reorder_df[['SKU', 'Total', 'AMS', 'Month_Cover']],
+                column_config={
+                    "Month_Cover": st.column_config.NumberColumn(
+                        "Cover (Months)", format="%.1f m"
+                    ),
+                    "AMS": st.column_config.NumberColumn(
+                        "Avg Sales/Mo", format="%.1f"
+                    )
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+
+        st.markdown("---")
+
+        # C. DEEP DIVE: SKU MASTER TABLE
+        st.subheader("🔍 Detailed Inventory Analysis")
+        
+        # Tambahkan visual highlight pada tabel
+        # Kita pakai Pandas Styler untuk mewarnai row/cell (Advanced)
+        
+        # Filter Table Interactive
+        filter_status = st.multiselect("Filter by Status:", df_analysis['Status'].unique(), default=df_analysis['Status'].unique())
+        df_view = df_analysis[df_analysis['Status'].isin(filter_status)]
+        
+        # Tampilkan
+        st.dataframe(
+            df_view[['SKU', 'Status', 'Total', 'Qty_3Mo', 'AMS', 'Month_Cover']],
+            column_config={
+                "Status": st.column_config.TextColumn("Health Status"),
+                "Total": st.column_config.ProgressColumn(
+                    "Current Stock", format="%d", min_value=0, max_value=int(df_analysis['Total'].max())
+                ),
+                "Month_Cover": st.column_config.NumberColumn(
+                    "Month Cover", format="%.1f x", help="Stock / Avg Monthly Sales"
+                )
+            },
+            hide_index=True,
+            use_container_width=True,
+            height=500
+        )
+        
+        # Download Button
+        csv = df_view.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            "📥 Download Analysis Report",
+            csv,
+            "supply_chain_report.csv",
+            "text/csv",
+            key='download-csv'
+        )
+
+    else:
+        st.warning("Data Sales atau Stock belum berhasil di-load sepenuhnya.")
 
 except Exception as e:
-    st.error(f"Terjadi kesalahan: {e}")
-    st.info("Pastikan nama kolom di Google Sheet persis dengan yang diminta (Case Sensitive).")
+    st.error(f"Terjadi kesalahan logic: {e}")
+    # Print detail error untuk debugging
+    import traceback
+    st.text(traceback.format_exc())
