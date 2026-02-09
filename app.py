@@ -118,28 +118,50 @@ def load_data():
         ws_store_kamus = sh_kamus.get_worksheet(0)
         df_store_kamus = pd.DataFrame(ws_store_kamus.get_all_records())
         
-        # Validasi kolom Store
-        if 'Store' not in df_store_kamus.columns:
-            st.warning("⚠️ Kolom 'Store' tidak ditemukan di Sheet 1. Menggunakan POS sebagai fallback.")
-            if 'POS' in df_store_kamus.columns:
+        # Debug: Tampilkan kolom yang ada di Sheet 1
+        st.sidebar.info(f"📋 Kolom di Sheet 1: {', '.join(df_store_kamus.columns.tolist())}")
+        
+        # Validasi kolom Store di Sheet 1
+        if 'Store' in df_store_kamus.columns:
+            st.sidebar.success("✅ Kolom 'Store' ditemukan di Sheet 1")
+        else:
+            st.sidebar.error("❌ Kolom 'Store' tidak ditemukan di Sheet 1")
+            # Coba cari kolom dengan nama yang mirip
+            store_cols = [col for col in df_store_kamus.columns if 'store' in col.lower() or 'nama' in col.lower()]
+            if store_cols:
+                df_store_kamus = df_store_kamus.rename(columns={store_cols[0]: 'Store'})
+                st.sidebar.success(f"✅ Menggunakan kolom '{store_cols[0]}' sebagai Store")
+            elif 'POS' in df_store_kamus.columns:
                 df_store_kamus['Store'] = df_store_kamus['POS']
+                st.sidebar.warning("⚠️ Menggunakan POS sebagai Store name")
         
         # Sheet 2: SKU Kamus (SKU dan Kategori)
         ws_sku_kamus = sh_kamus.get_worksheet(1)
         df_sku_kamus = pd.DataFrame(ws_sku_kamus.get_all_records())
         
-        # Validasi kolom
+        # Debug: Tampilkan kolom yang ada di Sheet 2
+        st.sidebar.info(f"📋 Kolom di Sheet 2: {', '.join(df_sku_kamus.columns.tolist())}")
+        
+        # Validasi kolom SKU dan SKU_Category
         if 'SKU' not in df_sku_kamus.columns:
-            st.error("❌ Kolom 'SKU' tidak ditemukan di Sheet 2")
-            df_sku_kamus = pd.DataFrame()
+            sku_cols = [col for col in df_sku_kamus.columns if 'sku' in col.lower()]
+            if sku_cols:
+                df_sku_kamus = df_sku_kamus.rename(columns={sku_cols[0]: 'SKU'})
+            else:
+                st.sidebar.error("❌ Kolom 'SKU' tidak ditemukan di Sheet 2")
+                return None, None, None, None
+        
         if 'SKU_Category' not in df_sku_kamus.columns:
-            st.error("❌ Kolom 'SKU_Category' tidak ditemukan di Sheet 2")
-            df_sku_kamus = pd.DataFrame()
-            
+            category_cols = [col for col in df_sku_kamus.columns if 'category' in col.lower() or 'kategori' in col.lower()]
+            if category_cols:
+                df_sku_kamus = df_sku_kamus.rename(columns={category_cols[0]: 'SKU_Category'})
+            else:
+                st.sidebar.error("❌ Kolom 'SKU_Category' tidak ditemukan di Sheet 2")
+                return None, None, None, None
+                
     except Exception as e:
         st.error(f"⚠️ Error loading kamus data: {e}")
-        df_store_kamus = pd.DataFrame()
-        df_sku_kamus = pd.DataFrame()
+        return None, None, None, None
     
     # List semua spreadsheet
     all_files = gc.list_spreadsheet_files()
@@ -168,7 +190,14 @@ def load_data():
         ws_sales = gc.open_by_key(file_ids['export']).get_worksheet(0)
         df_sales = pd.DataFrame(ws_sales.get_all_records())
         cols_sales = ['Ordernumber', 'Orderdate', 'ItemSKU', 'ItemPrice', 'ItemOrdered']
-        df_sales = df_sales[cols_sales] if all(col in df_sales.columns for col in cols_sales) else df_sales
+        
+        # Validasi kolom sales
+        available_cols = [col for col in cols_sales if col in df_sales.columns]
+        if len(available_cols) < 3:
+            st.error("❌ Kolom sales tidak lengkap")
+            df_sales = pd.DataFrame()
+        else:
+            df_sales = df_sales[available_cols]
     else:
         st.error("❌ File sales (export_) tidak ditemukan!")
         df_sales = pd.DataFrame()
@@ -177,7 +206,7 @@ def load_data():
     stock_dfs = []
     store_mapping = {'amb': 'AMB', 'bsb': 'BSB', 'mcd': 'MCD'}
     
-    for key, store_name in store_mapping.items():
+    for key, store_code in store_mapping.items():
         if file_ids[key]:
             try:
                 ws = gc.open_by_key(file_ids[key]).get_worksheet(0)
@@ -187,7 +216,7 @@ def load_data():
                     col_mapping = {}
                     for col in df.columns:
                         col_lower = col.lower()
-                        if 'location' in col_lower or 'store' in col_lower:
+                        if 'location' in col_lower or 'store' in col_lower or 'pos' in col_lower:
                             col_mapping[col] = 'Location Code'
                         elif 'sku' in col_lower:
                             col_mapping[col] = 'SKU'
@@ -195,13 +224,21 @@ def load_data():
                             col_mapping[col] = 'Total'
                     
                     df = df.rename(columns=col_mapping)
-                    required_cols = ['Location Code', 'SKU', 'Total']
                     
-                    if all(col in df.columns for col in required_cols):
-                        df['Store_Name'] = store_name
-                        stock_dfs.append(df[['Location Code', 'SKU', 'Total', 'Store_Name']])
+                    # Pastikan kolom yang dibutuhkan ada
+                    if 'SKU' not in df.columns or 'Total' not in df.columns:
+                        st.warning(f"⚠️ Kolom SKU atau Total tidak ditemukan di file {store_code}")
+                        continue
+                    
+                    # Jika tidak ada Location Code, tambahkan dari store_code
+                    if 'Location Code' not in df.columns:
+                        df['Location Code'] = store_code
+                    
+                    df['Store_Code'] = store_code  # Simpan kode store asli
+                    stock_dfs.append(df[['Location Code', 'SKU', 'Total', 'Store_Code']])
+                    
             except Exception as e:
-                st.warning(f"⚠️ Gagal load stock data untuk {store_name}: {e}")
+                st.warning(f"⚠️ Gagal load stock data untuk {store_code}: {e}")
     
     df_stock_total = pd.concat(stock_dfs, ignore_index=True) if stock_dfs else pd.DataFrame()
     
@@ -458,23 +495,39 @@ try:
     df_sales['Orderdate'] = pd.to_datetime(df_sales['Orderdate'], dayfirst=True, errors='coerce')
     df_sales = df_sales.dropna(subset=['Orderdate'])
     
-    # Mapping store code dengan nama store dari kolom Store
+    # Mapping store code dengan nama store dari kolom Store di Sheet 1
     df_sales['POS_Code'] = df_sales['Ordernumber'].astype(str).str[:4]
     
-    # Merge dengan store kamus untuk mendapatkan nama store
-    if 'Store' in df_store_kamus.columns:
-        store_mapping = df_store_kamus.set_index('POS')['Store'].to_dict()
-        df_sales_mapped = df_sales.copy()
-        df_sales_mapped['Store_Name'] = df_sales_mapped['POS_Code'].map(store_mapping)
+    # Buat mapping dari POS ke Store Name dari df_store_kamus
+    if 'Store' in df_store_kamus.columns and 'POS' in df_store_kamus.columns:
+        pos_to_store_mapping = df_store_kamus.set_index('POS')['Store'].to_dict()
         
-        # Update store names di stock data jika ada mapping
+        # Apply mapping ke sales data
+        df_sales_mapped = df_sales.copy()
+        df_sales_mapped['Store_Name'] = df_sales_mapped['POS_Code'].map(pos_to_store_mapping)
+        
+        # Apply mapping ke stock data
         if 'Location Code' in df_stock.columns:
-            df_stock['Store_Name'] = df_stock['Location Code'].map(store_mapping)
-            df_stock['Store_Name'] = df_stock['Store_Name'].fillna(df_stock['Store_Name'])  # Keep original if no mapping
+            # Coba mapping dari Location Code ke Store Name
+            df_stock['Store_Name'] = df_stock['Location Code'].map(pos_to_store_mapping)
+            
+            # Jika tidak ada mapping, gunakan Store_Code (AMB, BSB, MCD) dengan mapping custom
+            store_code_mapping = {'AMB': 'AEON Mall BSD', 'BSB': 'Botani Square Bogor', 'MCD': 'Margo City Depok'}
+            missing_mask = df_stock['Store_Name'].isna()
+            df_stock.loc[missing_mask, 'Store_Name'] = df_stock.loc[missing_mask, 'Store_Code'].map(store_code_mapping)
+            
+        st.success(f"✅ Store mapping berhasil: {len(pos_to_store_mapping)} stores ditemukan")
+        
+        # Tampilkan preview mapping
+        with st.expander("🔍 Preview Store Mapping", expanded=False):
+            st.write("POS Code → Store Name Mapping:")
+            for pos, store_name in list(pos_to_store_mapping.items())[:5]:
+                st.write(f"{pos} → {store_name}")
+                
     else:
-        # Fallback jika tidak ada kolom Store
+        st.warning("⚠️ Tidak dapat melakukan store mapping. Kolom 'Store' atau 'POS' tidak ditemukan di Sheet 1")
+        # Fallback: gunakan kolom yang ada
         df_sales_mapped = pd.merge(df_sales, df_store_kamus, left_on='POS_Code', right_on='POS', how='left')
-        df_sales_mapped['Store_Name'] = df_sales_mapped['Store_Name']  # Use existing column
     
     # --- SIDEBAR FILTER PROFESIONAL ---
     with st.sidebar:
